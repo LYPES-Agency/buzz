@@ -1,0 +1,109 @@
+# Buzz LYPES
+
+This fork keeps the official `block/buzz` history available as `upstream` and
+uses `lypes/main` as the LYPES integration branch.
+
+## Current patch
+
+- Cross-owner managed-agent mentions from
+  [block/buzz#2893](https://github.com/block/buzz/pull/2893).
+- The patch keeps a channel-member agent in `@` autocomplete even when another
+  person or machine manages it.
+- The selected mention still carries the agent pubkey and does not start the
+  remote process locally.
+
+This fixes mention discovery. It does not yet fix cross-device instance
+configuration and duplicate local agent offers tracked by
+[block/buzz#3753](https://github.com/block/buzz/issues/3753).
+
+## Remotes and branches
+
+```text
+origin    git@github.com:LYPES-Agency/buzz.git
+upstream  git@github.com:block/buzz.git
+
+main        clean fork baseline
+lypes/main  LYPES integration and build branch
+```
+
+Update the LYPES branch without rewriting its published history:
+
+```bash
+git fetch upstream main
+git switch lypes/main
+git merge upstream/main
+just desktop-test
+just desktop-check
+just desktop-build
+git push origin lypes/main
+```
+
+When upstream ships an equivalent fix, remove the local patch only after
+verifying the resulting tree and the real two-user scenario.
+
+## Build
+
+The LYPES build has a separate macOS application identifier and product name,
+so it can be installed alongside the official Buzz app. It also disables the
+official updater and uses the `buzz-lypes://` deep-link scheme to avoid taking
+ownership of the official app's `buzz://` links.
+
+Build for the current Apple Silicon machine:
+
+```bash
+./scripts/build-lypes-desktop.sh
+```
+
+Build for Intel macOS:
+
+```bash
+./scripts/build-lypes-desktop.sh x86_64-apple-darwin
+```
+
+Opt into the much larger local Mesh LLM build only when it is actually needed:
+
+```bash
+BUZZ_LYPES_MESH=1 ./scripts/build-lypes-desktop.sh
+```
+
+The script packages real release sidecars for agents and produces an unsigned
+`.app` and `.dmg` under:
+
+```text
+target/lypes/<target>/release/bundle/
+```
+
+Unsigned macOS builds are suitable for local testing. Distributing them to
+other Macs without Gatekeeper warnings requires a LYPES Apple Developer
+certificate and notarization.
+
+## Mac Mini deployment
+
+The operational installation lives on the LYPES Mac Mini, separate from any
+official Buzz installation:
+
+```text
+/Users/feliperico/Applications/Buzz LYPES.app
+```
+
+The current package is an Apple Silicon (`arm64`) build. After producing a new
+artifact, copy the `.dmg` to the Mac Mini, verify its SHA-256 checksum, mount it,
+and replace only the `Buzz LYPES.app` bundle. Do not overwrite `Buzz.app`.
+
+## Validation
+
+Before using a new build:
+
+```bash
+just desktop-test
+just desktop-check
+just desktop-build
+```
+
+Then verify with two community members:
+
+1. Member A starts an agent and sets access to everyone.
+2. The agent and Member B both join the same channel.
+3. Member B selects the remote agent from `@` autocomplete.
+4. The sent event carries the agent pubkey and the agent responds.
+5. Member B's machine does not start another local copy of that agent.
