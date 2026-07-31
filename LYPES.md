@@ -77,6 +77,35 @@ Unsigned macOS builds are suitable for local testing. Distributing them to
 other Macs without Gatekeeper warnings requires a LYPES Apple Developer
 certificate and notarization.
 
+### Windows 11
+
+Every push to `lypes/main` automatically builds a 64-bit Windows 11 NSIS
+installer in the `Buzz LYPES Windows` GitHub Actions workflow. The artifact
+contains the installer and its SHA-256 checksum and remains available for 30
+days.
+
+List the latest builds and download one from the command line:
+
+```bash
+gh run list \
+  --repo LYPES-Agency/buzz \
+  --workflow lypes-windows.yml \
+  --branch lypes/main
+
+gh run download <run-id> \
+  --repo LYPES-Agency/buzz \
+  --name <artifact-name> \
+  --dir target/lypes/windows
+```
+
+The Windows package uses the LYPES product name and identifier and can be
+installed without replacing official Buzz. It targets Intel/AMD 64-bit Windows
+11 machines; Windows on ARM is not currently packaged.
+
+The installer is currently unsigned. Windows SmartScreen may therefore require
+the employee to choose **More info** and then **Run anyway**. Removing that
+warning requires a LYPES Authenticode code-signing certificate.
+
 ## Mac Mini deployment
 
 The operational installation lives on the LYPES Mac Mini, separate from any
