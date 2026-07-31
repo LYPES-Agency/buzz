@@ -26,6 +26,14 @@ use crate::filter::SubscriptionRule;
 /// Override via `--idle-timeout` / `BUZZ_ACP_IDLE_TIMEOUT`.
 pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
+/// Default delay before a long-running channel turn posts a visible progress
+/// update. Set `BUZZ_ACP_PROGRESS_UPDATE_AFTER=0` to disable.
+pub(crate) const DEFAULT_PROGRESS_UPDATE_AFTER_SECS: u64 = 180;
+
+/// Default visible progress copy for long-running turns.
+pub(crate) const DEFAULT_PROGRESS_UPDATE_MESSAGE: &str =
+    "Ainda estou trabalhando nisso. Publico o resultado aqui assim que concluir.";
+
 /// Default absolute wall-clock cap per agent turn (2 hours).
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
@@ -302,6 +310,23 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
     pub turn_liveness_secs: u64,
 
+    /// Seconds before a long-running channel turn posts one visible progress
+    /// update. 0 = disabled.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PROGRESS_UPDATE_AFTER",
+        default_value_t = DEFAULT_PROGRESS_UPDATE_AFTER_SECS
+    )]
+    pub progress_update_after: u64,
+
+    /// Visible message posted when a turn reaches the progress-update delay.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PROGRESS_UPDATE_MESSAGE",
+        default_value = DEFAULT_PROGRESS_UPDATE_MESSAGE
+    )]
+    pub progress_update_message: String,
+
     /// Heartbeat prompt text. Conflicts with --heartbeat-prompt-file.
     #[arg(
         long,
@@ -503,6 +528,11 @@ pub struct Config {
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
     pub turn_liveness_secs: u64,
+    /// Seconds before a long-running channel turn posts one visible progress
+    /// update. 0 disables progress updates.
+    pub progress_update_after_secs: u64,
+    /// Message used for the visible long-running turn progress update.
+    pub progress_update_message: String,
     pub heartbeat_prompt: Option<String>,
     pub system_prompt: Option<String>,
     /// Team-owned instructions layered separately from the agent system prompt.
@@ -861,6 +891,14 @@ impl Config {
             ));
         }
 
+        let progress_update_message = args.progress_update_message.trim().to_string();
+        if args.progress_update_after > 0 && progress_update_message.is_empty() {
+            return Err(ConfigError::ConfigFile(
+                "progress update message must not be empty when progress updates are enabled"
+                    .into(),
+            ));
+        }
+
         let heartbeat_prompt = if let Some(text) = args.heartbeat_prompt {
             Some(text)
         } else if let Some(ref path) = args.heartbeat_prompt_file {
@@ -1064,6 +1102,8 @@ impl Config {
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
+            progress_update_after_secs: args.progress_update_after,
+            progress_update_message,
             heartbeat_prompt,
             system_prompt,
             team_instructions: args
@@ -1123,7 +1163,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s progress_update={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1133,6 +1173,7 @@ impl Config {
             self.max_turn_duration_secs,
             self.agents,
             self.heartbeat_interval_secs,
+            self.progress_update_after_secs,
             self.subscribe_mode,
             self.dedup_mode,
             self.multiple_event_handling,
@@ -1442,6 +1483,8 @@ mod tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            progress_update_after_secs: DEFAULT_PROGRESS_UPDATE_AFTER_SECS,
+            progress_update_message: DEFAULT_PROGRESS_UPDATE_MESSAGE.into(),
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -2182,6 +2225,56 @@ channels = "ALL"
     }
 
     #[test]
+    fn progress_update_defaults_to_three_minutes() {
+        let key = "0".repeat(64);
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(
+            args.progress_update_after,
+            DEFAULT_PROGRESS_UPDATE_AFTER_SECS
+        );
+        assert_eq!(
+            args.progress_update_message,
+            DEFAULT_PROGRESS_UPDATE_MESSAGE
+        );
+    }
+
+    #[test]
+    fn enabled_progress_update_rejects_blank_message() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--progress-update-after",
+            "180",
+            "--progress-update-message",
+            "   ",
+        ]);
+        let error = Config::from_args(args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("progress update message must not be empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn disabled_progress_update_allows_blank_message() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--progress-update-after",
+            "0",
+            "--progress-update-message",
+            "   ",
+        ]);
+        let config = Config::from_args(args).expect("disabled progress updates allow blank copy");
+        assert_eq!(config.progress_update_after_secs, 0);
+        assert!(config.progress_update_message.is_empty());
+    }
+
+    #[test]
     fn test_summary_includes_agents_and_heartbeat() {
         let config = test_config(SubscribeMode::Mentions);
         let s = config.summary();
@@ -2395,6 +2488,12 @@ channels = "ALL"
         assert!(
             summary.contains(&format!("max_turn={DEFAULT_MAX_TURN_DURATION_SECS}s")),
             "summary should include max_turn: {summary}"
+        );
+        assert!(
+            summary.contains(&format!(
+                "progress_update={DEFAULT_PROGRESS_UPDATE_AFTER_SECS}s"
+            )),
+            "summary should include progress-update timing: {summary}"
         );
     }
 

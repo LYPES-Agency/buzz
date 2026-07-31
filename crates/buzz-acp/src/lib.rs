@@ -16,7 +16,7 @@ pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
@@ -1164,6 +1164,156 @@ struct SteerAckEvent {
     ack: std::result::Result<pool::SteerAck, tokio::sync::oneshot::error::RecvError>,
 }
 
+/// Tracks one visible progress update per active channel turn.
+///
+/// This is separate from typing indicators: operators may disable ephemeral
+/// typing events while still wanting durable feedback for long-running work.
+#[derive(Default)]
+struct ProgressUpdateTracker {
+    started_at: HashMap<Uuid, Instant>,
+    announced: HashSet<Uuid>,
+}
+
+impl ProgressUpdateTracker {
+    fn start(&mut self, channel_id: Uuid, now: Instant) {
+        self.started_at.insert(channel_id, now);
+        self.announced.remove(&channel_id);
+    }
+
+    fn collect_due(
+        &mut self,
+        active_channels: &HashMap<Uuid, ThreadTags>,
+        now: Instant,
+        after: Duration,
+    ) -> Vec<(Uuid, ThreadTags)> {
+        self.started_at
+            .retain(|channel_id, _| active_channels.contains_key(channel_id));
+        self.announced
+            .retain(|channel_id| active_channels.contains_key(channel_id));
+
+        let mut due = Vec::new();
+        for (&channel_id, thread_tags) in active_channels {
+            let started_at = *self.started_at.entry(channel_id).or_insert(now);
+            let elapsed = now.checked_duration_since(started_at).unwrap_or_default();
+            if elapsed >= after && self.announced.insert(channel_id) {
+                due.push((channel_id, thread_tags.clone()));
+            }
+        }
+        due
+    }
+}
+
+fn track_channel_turn(
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    progress_updates: &mut ProgressUpdateTracker,
+    channel_id: Uuid,
+    thread_tags: ThreadTags,
+) {
+    typing_channels.insert(channel_id, thread_tags);
+    progress_updates.start(channel_id, Instant::now());
+}
+
+#[cfg(test)]
+mod progress_update_tracker_tests {
+    use super::*;
+
+    fn tags(root: &str) -> ThreadTags {
+        ThreadTags {
+            root_event_id: Some(root.into()),
+            parent_event_id: Some(root.into()),
+            mentioned_pubkeys: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn progress_update_becomes_due_once_after_threshold() {
+        let channel_id = Uuid::new_v4();
+        let started_at = Instant::now();
+        let mut tracker = ProgressUpdateTracker::default();
+        let mut active = HashMap::new();
+        active.insert(channel_id, tags("root-event"));
+        tracker.start(channel_id, started_at);
+
+        assert!(tracker
+            .collect_due(
+                &active,
+                started_at + Duration::from_secs(179),
+                Duration::from_secs(180),
+            )
+            .is_empty());
+
+        let due = tracker.collect_due(
+            &active,
+            started_at + Duration::from_secs(180),
+            Duration::from_secs(180),
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, channel_id);
+        assert_eq!(due[0].1.root_event_id.as_deref(), Some("root-event"));
+
+        assert!(
+            tracker
+                .collect_due(
+                    &active,
+                    started_at + Duration::from_secs(360),
+                    Duration::from_secs(180),
+                )
+                .is_empty(),
+            "a turn must publish at most one progress update"
+        );
+    }
+
+    #[test]
+    fn starting_a_new_turn_resets_the_progress_update() {
+        let channel_id = Uuid::new_v4();
+        let first_start = Instant::now();
+        let mut tracker = ProgressUpdateTracker::default();
+        let mut active = HashMap::new();
+        active.insert(channel_id, tags("first-root"));
+        tracker.start(channel_id, first_start);
+        assert_eq!(
+            tracker
+                .collect_due(
+                    &active,
+                    first_start + Duration::from_secs(180),
+                    Duration::from_secs(180),
+                )
+                .len(),
+            1
+        );
+
+        let second_start = first_start + Duration::from_secs(200);
+        active.insert(channel_id, tags("second-root"));
+        tracker.start(channel_id, second_start);
+        let due = tracker.collect_due(
+            &active,
+            second_start + Duration::from_secs(180),
+            Duration::from_secs(180),
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.root_event_id.as_deref(), Some("second-root"));
+    }
+
+    #[test]
+    fn completed_turns_are_removed_before_they_can_become_due() {
+        let channel_id = Uuid::new_v4();
+        let started_at = Instant::now();
+        let mut tracker = ProgressUpdateTracker::default();
+        tracker.start(channel_id, started_at);
+
+        let active = HashMap::new();
+        assert!(tracker
+            .collect_due(
+                &active,
+                started_at + Duration::from_secs(180),
+                Duration::from_secs(180),
+            )
+            .is_empty());
+        assert!(tracker.started_at.is_empty());
+        assert!(tracker.announced.is_empty());
+    }
+}
+
 /// RAII guard that ensures a `RespawnResult` is sent even if the task panics.
 /// Without this, a panicked respawn task would leave `respawn_in_flight = true`
 /// permanently, silently losing the slot forever.
@@ -1599,6 +1749,16 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
+    let mut progress_refresh = if config.progress_update_after_secs > 0 {
+        let cadence = Duration::from_secs(config.progress_update_after_secs.clamp(1, 5));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + cadence,
+            cadence,
+        ))
+    } else {
+        None
+    };
+    let mut progress_updates = ProgressUpdateTracker::default();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Runs at the TOP of every loop iteration via Instant check — cannot be
@@ -1775,7 +1935,12 @@ async fn tokio_main() -> Result<()> {
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                    track_channel_turn(
+                        &mut typing_channels,
+                        &mut progress_updates,
+                        channel_id,
+                        thread_tags,
+                    );
                 }
             }
         }
@@ -1811,7 +1976,12 @@ async fn tokio_main() -> Result<()> {
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
             for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                typing_channels.insert(channel_id, thread_tags);
+                track_channel_turn(
+                    &mut typing_channels,
+                    &mut progress_updates,
+                    channel_id,
+                    thread_tags,
+                );
             }
         }
 
@@ -2260,7 +2430,12 @@ async fn tokio_main() -> Result<()> {
                                 for (channel_id, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx)
                                 {
-                                    typing_channels.insert(channel_id, thread_tags);
+                                    track_channel_turn(
+                                        &mut typing_channels,
+                                        &mut progress_updates,
+                                        channel_id,
+                                        thread_tags,
+                                    );
                                 }
                             }
                         }
@@ -2289,7 +2464,12 @@ async fn tokio_main() -> Result<()> {
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
                         {
-                            typing_channels.insert(channel_id, thread_tags);
+                            track_channel_turn(
+                                &mut typing_channels,
+                                &mut progress_updates,
+                                channel_id,
+                                thread_tags,
+                            );
                         }
                     } else if pool.any_idle() {
                         dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
@@ -2341,6 +2521,37 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
+                _ = async {
+                    match progress_refresh.as_mut() {
+                        Some(t) => t.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    let due = progress_updates.collect_due(
+                        &typing_channels,
+                        Instant::now(),
+                        Duration::from_secs(config.progress_update_after_secs),
+                    );
+                    for (channel_id, thread_tags) in due {
+                        let rest = ctx.rest_client.clone();
+                        let content = config.progress_update_message.clone();
+                        tracing::info!(
+                            channel = %channel_id,
+                            "posting long-running turn progress update"
+                        );
+                        tokio::spawn(async move {
+                            pool::post_progress_update(
+                                &rest,
+                                channel_id,
+                                &thread_tags,
+                                &content,
+                            )
+                            .await;
+                        });
+                    }
+                    None
+                }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutting down");
                     break;
@@ -2386,7 +2597,12 @@ async fn tokio_main() -> Result<()> {
                     break;
                 }
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                    track_channel_turn(
+                        &mut typing_channels,
+                        &mut progress_updates,
+                        channel_id,
+                        thread_tags,
+                    );
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
@@ -2409,7 +2625,12 @@ async fn tokio_main() -> Result<()> {
                     break;
                 }
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                    track_channel_turn(
+                        &mut typing_channels,
+                        &mut progress_updates,
+                        channel_id,
+                        thread_tags,
+                    );
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {
@@ -2551,7 +2772,12 @@ async fn tokio_main() -> Result<()> {
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
                 for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                    track_channel_turn(
+                        &mut typing_channels,
+                        &mut progress_updates,
+                        channel_id,
+                        thread_tags,
+                    );
                 }
             }
             Some(PoolEvent::Wake(attempt, result)) => {
@@ -2579,7 +2805,12 @@ async fn tokio_main() -> Result<()> {
                         for (channel_id, thread_tags) in
                             dispatch_pending(&mut pool, &mut queue, &ctx)
                         {
-                            typing_channels.insert(channel_id, thread_tags);
+                            track_channel_turn(
+                                &mut typing_channels,
+                                &mut progress_updates,
+                                channel_id,
+                                thread_tags,
+                            );
                         }
                     }
                     Err(error) => {
@@ -5005,6 +5236,8 @@ mod build_mcp_servers_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            progress_update_after_secs: config::DEFAULT_PROGRESS_UPDATE_AFTER_SECS,
+            progress_update_message: config::DEFAULT_PROGRESS_UPDATE_MESSAGE.into(),
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -5226,6 +5459,8 @@ mod error_outcome_emission_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            progress_update_after_secs: config::DEFAULT_PROGRESS_UPDATE_AFTER_SECS,
+            progress_update_message: config::DEFAULT_PROGRESS_UPDATE_MESSAGE.into(),
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,

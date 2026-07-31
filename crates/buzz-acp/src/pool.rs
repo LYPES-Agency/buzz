@@ -3800,15 +3800,16 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
-pub(crate) async fn post_failure_notice(
+/// Best-effort: post a visible harness notice (kind:9) to a channel. Replies
+/// into the thread of `thread_tags` when the triggering event was threaded.
+/// Errors are logged and swallowed — a notice must never take down the main
+/// loop.
+async fn post_channel_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
+    notice_kind: &'static str,
 ) {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
@@ -3826,22 +3827,58 @@ pub(crate) async fn post_failure_notice(
         match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+                tracing::warn!(
+                    channel = %channel_id,
+                    notice_kind,
+                    "channel notice: build failed: {e}"
+                );
                 return;
             }
         };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
+            tracing::warn!(
+                channel = %channel_id,
+                notice_kind,
+                "channel notice: sign failed: {e}"
+            );
             return;
         }
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+        Ok(Err(e)) => tracing::warn!(
+            channel = %channel_id,
+            notice_kind,
+            "channel notice failed: {e}"
+        ),
+        Err(_) => tracing::warn!(
+            channel = %channel_id,
+            notice_kind,
+            "channel notice timed out"
+        ),
     }
+}
+
+/// Best-effort visible notice after a batch is dead-lettered.
+pub(crate) async fn post_failure_notice(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) {
+    post_channel_notice(rest, channel_id, thread_tags, content, "failure").await;
+}
+
+/// Best-effort visible update for a long-running channel turn.
+pub(crate) async fn post_progress_update(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) {
+    post_channel_notice(rest, channel_id, thread_tags, content, "progress").await;
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
