@@ -29,6 +29,7 @@ cargo build \
     --target "$TARGET" \
     -p buzz-acp \
     -p buzz-agent \
+    -p buzz-backend-kubernetes \
     -p buzz-dev-mcp \
     -p git-credential-nostr \
     -p buzz-cli
@@ -37,7 +38,7 @@ BINARIES_DIR="$REPO_ROOT/desktop/src-tauri/binaries"
 SIDECAR_SOURCE="$CARGO_TARGET_DIR/$TARGET/release"
 mkdir -p "$BINARIES_DIR"
 
-for binary in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+for binary in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
     source_path="$SIDECAR_SOURCE/$binary"
     destination="$BINARIES_DIR/$binary-$TARGET"
 

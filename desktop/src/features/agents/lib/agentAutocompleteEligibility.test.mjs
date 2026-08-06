@@ -3,12 +3,15 @@ import test from "node:test";
 
 import {
   coalesceAgentAutocompleteCandidates,
+  filterCachedAgentSuggestions,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentIdentityInManagedList,
+  isAgentIdentityInAllowedList,
+  isAgentMentionChannelType,
+  relayAgentCanRespondInChannel,
   relayAgentIsSharedWithUser,
-  shouldDropAgentMentionCandidate,
   shouldHideAgentFromMentions,
+  uniqueAutocompleteLabels,
 } from "./agentAutocompleteEligibility.ts";
 
 const CURRENT_PUBKEY = "a".repeat(64);
@@ -107,8 +110,30 @@ test("relayAgentIsSharedWithUser: accepts allowlist agents for the current user"
   );
 });
 
+test("relayAgentCanRespondInChannel: requires exact channel membership and viewer access", () => {
+  const agent = {
+    respondTo: "allowlist",
+    respondToAllowlist: [CURRENT_PUBKEY],
+    channelIds: ["general"],
+  };
+
+  assert.equal(
+    relayAgentCanRespondInChannel(agent, "general", CURRENT_PUBKEY),
+    true,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(agent, "other", CURRENT_PUBKEY),
+    false,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(agent, "general", OTHER_OWNER_PUBKEY),
+    false,
+  );
+});
+
 test("getMentionableAgentPubkeys: keeps managed agents and shared relay agents", () => {
   const result = getMentionableAgentPubkeys({
+    eligibilityScope: { type: "community" },
     managedAgentPubkeys: [PUB_A],
     currentPubkey: CURRENT_PUBKEY,
     relayAgents: [
@@ -137,67 +162,96 @@ test("getMentionableAgentPubkeys: keeps managed agents and shared relay agents",
   assert.deepEqual(result, new Set([PUB_A, PUB_B, PUB_C]));
 });
 
-test("isAgentIdentityInManagedList: keeps people and only current managed agent identities", () => {
-  const managedAgentPubkeys = new Set([PUB_A]);
+test("getMentionableAgentPubkeys: scopes channel composers and fails closed without context", () => {
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      respondTo: "allowlist",
+      respondToAllowlist: [CURRENT_PUBKEY],
+      channelIds: ["general"],
+    },
+  ];
+  const base = {
+    currentPubkey: CURRENT_PUBKEY,
+    managedAgentPubkeys: [PUB_A],
+    relayAgents,
+    sharedChannelIds: new Set(["general"]),
+  };
 
-  assert.equal(
-    isAgentIdentityInManagedList(
-      { isAgent: false, pubkey: PUB_B },
-      managedAgentPubkeys,
-    ),
-    true,
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "channel", channelId: "general" },
+    }),
+    new Set([PUB_A, PUB_B]),
   );
-  assert.equal(
-    isAgentIdentityInManagedList(
-      { isAgent: true, pubkey: PUB_A.toUpperCase() },
-      managedAgentPubkeys,
-    ),
-    true,
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "channel", channelId: "other" },
+    }),
+    new Set([PUB_A]),
   );
-  assert.equal(
-    isAgentIdentityInManagedList(
-      { isAgent: true, pubkey: PUB_B },
-      managedAgentPubkeys,
-    ),
-    false,
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "managed-only" },
+    }),
+    new Set([PUB_A]),
   );
 });
 
-test("shouldDropAgentMentionCandidate: keeps channel-member agents from other owners (#2508)", () => {
-  const managedAgentPubkeys = new Set([PUB_A]);
+test("autocomplete helper extraction preserves safe filtering and labels", () => {
+  assert.equal(isAgentMentionChannelType("stream"), true);
+  assert.equal(isAgentMentionChannelType("forum"), true);
+  assert.equal(isAgentMentionChannelType("dm"), false);
+  assert.equal(isAgentMentionChannelType(null), false);
 
-  // A channel-member agent managed on someone else's machine must stay
-  // mentionable for every member of the channel.
-  assert.equal(
-    shouldDropAgentMentionCandidate(
-      { isAgent: true, isMember: true, pubkey: PUB_B },
-      managedAgentPubkeys,
-    ),
-    false,
+  assert.deepEqual(
+    uniqueAutocompleteLabels([
+      { displayName: " Alice ", personaName: "alice" },
+      { displayName: null, secondaryLabel: "Bob" },
+      { displayName: "BOB" },
+    ]),
+    ["Alice", "Bob"],
   );
-  // Locally managed agents stay mentionable even when not channel members.
-  assert.equal(
-    shouldDropAgentMentionCandidate(
-      { isAgent: true, isMember: false, pubkey: PUB_A },
-      managedAgentPubkeys,
+
+  const person = { pubkey: PUB_A, isAgent: false };
+  const admittedAgent = { pubkey: PUB_B.toUpperCase(), isAgent: true };
+  const removedAgent = { pubkey: PUB_C, isAgent: true };
+  const persona = { isAgent: true };
+  assert.deepEqual(
+    filterCachedAgentSuggestions(
+      [person, admittedAgent, removedAgent, persona],
+      [{ pubkey: PUB_B, isAgent: true }],
     ),
-    false,
+    [person, admittedAgent, persona],
   );
-  // People are never dropped.
+});
+
+test("isAgentIdentityInAllowedList: keeps people and only explicitly allowed agent identities", () => {
+  const allowedAgentPubkeys = new Set([PUB_A]);
+
   assert.equal(
-    shouldDropAgentMentionCandidate(
-      { isAgent: false, isMember: false, pubkey: PUB_B },
-      managedAgentPubkeys,
-    ),
-    false,
-  );
-  // Non-member agent identities from other owners remain restricted (#2149).
-  assert.equal(
-    shouldDropAgentMentionCandidate(
-      { isAgent: true, isMember: false, pubkey: PUB_B },
-      managedAgentPubkeys,
+    isAgentIdentityInAllowedList(
+      { isAgent: false, pubkey: PUB_B },
+      allowedAgentPubkeys,
     ),
     true,
+  );
+  assert.equal(
+    isAgentIdentityInAllowedList(
+      { isAgent: true, pubkey: PUB_A.toUpperCase() },
+      allowedAgentPubkeys,
+    ),
+    true,
+  );
+  assert.equal(
+    isAgentIdentityInAllowedList(
+      { isAgent: true, pubkey: PUB_B },
+      allowedAgentPubkeys,
+    ),
+    false,
   );
 });
 

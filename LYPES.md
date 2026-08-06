@@ -3,18 +3,21 @@
 This fork keeps the official `block/buzz` history available as `upstream` and
 uses `lypes/main` as the LYPES integration branch.
 
-## Current patch
+## Current LYPES delta
 
-- Cross-owner managed-agent mentions from
-  [block/buzz#2893](https://github.com/block/buzz/pull/2893).
-- The patch keeps a channel-member agent in `@` autocomplete even when another
-  person or machine manages it.
-- The selected mention still carries the agent pubkey and does not start the
-  remote process locally.
+- Cross-owner managed-agent mentions now use the upstream implementation from
+  [block/buzz#4913](https://github.com/block/buzz/pull/4913). It supersedes the
+  fork's original patch based on
+  [block/buzz#2893](https://github.com/block/buzz/pull/2893) and scopes remote
+  agents to the current channel and their configured access policy.
+- Long-running agent turns publish one durable progress update after the
+  configured threshold, independently of ephemeral typing indicators.
+- LYPES desktop builds keep their own app identifier, updater policy, deep-link
+  scheme, macOS build script, and Windows workflow.
 
-This fixes mention discovery. It does not yet fix cross-device instance
-configuration and duplicate local agent offers tracked by
-[block/buzz#3753](https://github.com/block/buzz/issues/3753).
+The upstream mention fix covers discovery and routing. It does not by itself
+solve every cross-device instance-configuration or duplicate-local-offer case
+tracked by [block/buzz#3753](https://github.com/block/buzz/issues/3753).
 
 ## Remotes and branches
 
@@ -38,8 +41,8 @@ just desktop-build
 git push origin lypes/main
 ```
 
-When upstream ships an equivalent fix, remove the local patch only after
-verifying the resulting tree and the real two-user scenario.
+When upstream replaces another LYPES-specific behavior, remove the local patch
+only after verifying the resulting tree and the real team scenario.
 
 ## Build
 
